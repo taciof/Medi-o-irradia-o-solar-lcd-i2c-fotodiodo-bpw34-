@@ -1,0 +1,57 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int fotoDiodoPIN = A2;
+const int ledPin = 13;
+
+int leitura;
+float tensao, irradiacao;
+float fatorCalibracao = 0.5; // Ajuste conforme a calibração real
+float limiteAlerta = 500.0; // W/m² para acionar o LED
+
+void setup() {
+  pinMode(fotoDiodoPIN, INPUT);
+  pinMode(ledPin, OUTPUT);
+  Serial.begin(9600);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Hello World! ");
+  delay(1000);
+ 
+}
+
+void loop() {
+  // Lê o fotodiodo
+ 
+  leitura = analogRead(fotoDiodoPIN);
+  tensao = (leitura / 1023.0) * 5.0; // Converte para tensão (5 V)
+  irradiacao = tensao * fatorCalibracao * 1000.0; // Estimativa em W/m²
+
+  // Mostra valores no LCD
+  /*lcd_1.clear();
+  lcd_1.setCursor(0, 0);
+  lcd_1.print(tensao);
+  lcd_1.setCursor(0, 1);
+  lcd_1.print(irradiacao);  
+  */
+  Serial.println(leitura);
+  lcd.clear();  
+  lcd.setCursor(0, 0);
+  lcd.print(leitura);
+  //lcd.setCursor(0, 1);
+  //lcd.print(irradiacao);
+ 
+
+  // Aciona LED conforme limite
+  if (irradiacao > limiteAlerta) {
+    digitalWrite(ledPin, HIGH);
+  } else {
+    digitalWrite(ledPin, LOW);
+  }
+
+  delay(700); // Atualiza a cada meio segundo*/
+}
