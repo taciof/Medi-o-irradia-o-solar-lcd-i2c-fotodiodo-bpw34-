@@ -1,0 +1,90 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+#include <LowPower.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int fotoDiodoPIN = A2;
+const int ledPin = 13;
+
+float fatorCalibracao = 0.5; 
+float limiteAlerta = 500.0;
+
+int enderecoEEPROM = 0; // Endereço para gravação EEPROM (pode ser usado depois)
+
+const int num_leituras = 10;  // Número de leituras para média
+float soma_irradiacao = 0.0;
+int contador = 0;
+
+void setup() {
+  pinMode(fotoDiodoPIN, INPUT);
+  pinMode(ledPin, OUTPUT);
+  Serial.begin(9600);
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Sistema Pronto");
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  // Lê sensor
+  int leitura = analogRead(fotoDiodoPIN);
+  float tensao = (leitura / 1023.0) * 5.0;
+  float irradiacao = tensao * fatorCalibracao * 1000.0;
+
+  // Aciona LED
+  digitalWrite(ledPin, (irradiacao > limiteAlerta) ? HIGH : LOW);
+
+  // Soma para média
+  soma_irradiacao += irradiacao;
+  contador++;
+
+  Serial.print("Leitura ");
+  Serial.print(contador);
+  Serial.print(": ");
+  Serial.print(irradiacao);
+  Serial.println(" W/m2");
+
+  // Se atingiu número de leituras para média
+  if (contador >= num_leituras) {
+    float media = soma_irradiacao / num_leituras;
+
+    // Mostra média no LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Media irradiacao:");
+    lcd.setCursor(0, 1);
+    lcd.print(media, 1);
+    lcd.print(" W/m2");
+
+    Serial.print("MEDIA apos ");
+    Serial.print(num_leituras * 30);
+    Serial.print("s: ");
+    Serial.print(media);
+    Serial.println(" W/m2");
+
+    // Reseta para próximo ciclo
+    soma_irradiacao = 0.0;
+    contador = 0;
+
+    delay(5000); // Mostra média 5 segundos antes de dormir
+  } else {
+    // Enquanto não atingiu o número, mostra a leitura normal
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Irrad:");
+    lcd.print(irradiacao, 1);
+    lcd.setCursor(0, 1);
+    lcd.print("Leit:");
+    lcd.print(contador);
+  }
+
+  // Dorme por ~30 segundos (4x8s = 32s)
+  for (int i = 0; i < 4; i++) {
+    LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+  }
+}
