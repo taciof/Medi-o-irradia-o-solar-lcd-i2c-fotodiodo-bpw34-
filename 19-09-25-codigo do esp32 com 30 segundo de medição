@@ -1,0 +1,97 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+
+// Pinos
+const int fotoDiodoPIN = 27; // Fotodiodo no D27
+const int ledPin = 13;
+
+// Calibração
+float fatorCalibracao = 0.5; 
+float limiteAlerta = 500.0;
+
+// Média
+const int num_leituras = 10;  
+float soma_irradiacao = 0.0;
+int contador = 0;
+
+// I2C ESP32
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+void setup() {
+  pinMode(fotoDiodoPIN, INPUT);
+  pinMode(ledPin, OUTPUT);
+  Serial.begin(9600);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  lcd.init();
+  lcd.backlight();
+
+  // Mensagem inicial
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sistema Pronto");
+  delay(2000); // mostra por 2s
+}
+
+void loop() {
+  if (contador < num_leituras) {
+    // ---- Leitura normal ----
+    int leitura = analogRead(fotoDiodoPIN);
+    float tensao = (leitura / 4095.0) * 3.3; // ADC ESP32 12 bits
+    float irrad = tensao * fatorCalibracao * 1000.0; 
+
+    // Controle do LED
+    digitalWrite(ledPin, (irrad > limiteAlerta) ? HIGH : LOW);
+
+    // Soma para média
+    soma_irradiacao += irrad;
+    contador++;
+
+    // Serial Monitor
+    Serial.print("Leitura ");
+    Serial.print(contador);
+    Serial.print(": ");
+    Serial.print(irrad);
+    Serial.println(" W/m2");
+
+    // Atualiza LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Irrad:");
+    lcd.print(irrad, 1);  // 1 casa decimal
+
+    lcd.setCursor(0, 1);
+    lcd.print("Leit:");
+    lcd.print(contador);
+
+    delay(30000); // aguarda 30s entre leituras
+
+  } else {
+    // ---- Mostra média ----
+    float media = soma_irradiacao / num_leituras;
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Media Irrad:");
+    lcd.setCursor(0, 1);
+    lcd.print(media, 1);
+    lcd.print(" W/m2");
+
+    Serial.print("MEDIA apos ");
+    Serial.print(num_leituras * 30);
+    Serial.print("s: ");
+    Serial.print(media);
+    Serial.println(" W/m2");
+
+    delay(30000); // mantém a média visível por 30 segundos
+
+    // Reseta variáveis para próximo ciclo
+    soma_irradiacao = 0.0;
+    contador = 0;
+  }
+}
