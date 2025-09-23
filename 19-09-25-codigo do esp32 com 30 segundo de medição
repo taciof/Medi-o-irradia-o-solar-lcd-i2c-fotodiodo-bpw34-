@@ -66,7 +66,7 @@ void loop() {
     lcd.print(irrad, 1);  // 1 casa decimal
 
     lcd.setCursor(0, 1);
-    lcd.print("Leit:");
+    lcd.print("Leitura:");
     lcd.print(contador);
 
     delay(30000); // aguarda 30s entre leituras
