@@ -1,0 +1,747 @@
+// ========== SISTEMA SOLAR COMPLETO - MEDIA + TEMPO CORRETO ==========
+#define BLYNK_PRINT Serial
+#define BLYNK_TEMPLATE_ID "TMPL2CBALClFp"
+#define BLYNK_TEMPLATE_NAME "esp32fotodiodo"
+#define BLYNK_AUTH_TOKEN "Kfv6XpxuG-Hjuu6hHZg-DEfLEXDlHosV"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <HTTPClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <time.h>
+
+// ----------- CONFIGURAÇÕES -----------
+#define HORA_INICIO 8
+#define MINUTO_INICIO 0
+#define HORA_FIM 16
+#define MINUTO_FIM 0
+#define NUM_LEITURAS 11
+#define NUM_LEITURAS_DISPLAY 10
+
+// ----------- REDES WI-FI -----------
+struct Rede {
+  const char* ssid;
+  const char* senha;
+};
+Rede redes[] = {
+  {"Sakaninha wifi", "sgzq3535"},
+  {"brisa-1458023", "ppmxwzb6"},  
+  {"LUANA", "Luana1004@"},
+  {"JOAO", "JoaoVitor"},
+  {"EDUC-VISITANTES","visitante"}
+};
+const int totalRedes = sizeof(redes) / sizeof(redes[0]);
+
+// ----------- PINOS E VARIAVEIS -----------
+const int fotoDiodoPIN = 33;
+const int ledPin = 12;
+float fatorCalibracao = 1.4;
+float limiteAlerta = 600.0;
+
+//  VARIÁVEIS PARA SOMA E MÉDIA 
+float soma_irradiacao = 0.0;
+float leituras[NUM_LEITURAS];
+int contador = 0;
+float intervaloMin = 0;
+unsigned long proximaLeitura = 0;
+bool medicaoAtiva = false;
+bool cicloConcluidoHoje = false;
+bool wifiConectado = false;
+
+//  VARIÁVEIS PARA PAINÉIS SOLARES 
+bool paineisExibidos = false;
+unsigned long tempoExibicaoPainel = 0;
+int painelAtual = 0; // 0=pequeno, 1=médio, 2=grande
+
+//  NOVAS VARIÁVEIS DE CONTROLE DE ESTADO 
+enum EstadoSistema {
+  AGUARDANDO_INICIO,
+  EXIBINDO_INTERVALO,
+  MEDINDO,
+  EXIBINDO_MEDIA_FINAL,
+  EXIBINDO_PAINEIS,
+  HORARIO_FINALIZADO
+};
+EstadoSistema estadoAtual = AGUARDANDO_INICIO;
+
+unsigned long tempoEstadoInicio = 0;
+const unsigned long TEMPO_EXIBICAO_INTERVALO = 10000; // 10 segundos
+const unsigned long TEMPO_EXIBICAO_MEDIA = 10000;     // 10 segundos
+const unsigned long TEMPO_EXIBICAO_PAINEL = 60000;    // 1 minuto por painel
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+BlynkTimer timer;
+
+const char* scriptURL = "https://script.google.com/macros/s/AKfycbxawxObLTU4ddjo4pGhKfjwTy4SX8ClXJBRoCzy9HIqKCnH1c3IrkbGukjNmQGWOViI9w/exec";
+
+// ========== CONEXAO WI-FI ==========
+void conectarWiFiRapido() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConectado = true;
+    return;
+  }
+  
+  lcd.clear();
+  lcd.print("Procurando WiFi");
+  
+  Serial.println("Escaneando redes...");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    lcd.setCursor(0, 1);
+    lcd.print("Nenhuma rede");
+    wifiConectado = false;
+    return;
+  }
+  
+  String melhorRede = "";
+  String melhorSenha = "";
+  int melhorForca = -1000;
+  
+  for (int i = 0; i < n; i++) {
+    String ssidScan = WiFi.SSID(i);
+    int forca = WiFi.RSSI(i);
+    
+    for (int j = 0; j < totalRedes; j++) {
+      if (ssidScan == redes[j].ssid) {
+        if (forca > melhorForca) {
+          melhorForca = forca;
+          melhorRede = redes[j].ssid;
+          melhorSenha = redes[j].senha;
+        }
+      }
+    }
+  }
+  
+  if (melhorRede != "") {
+    lcd.clear();
+    lcd.print("Conectando:");
+    lcd.setCursor(0, 1);
+    lcd.print(melhorRede);
+    
+    WiFi.begin(melhorRede.c_str(), melhorSenha.c_str());
+    
+    unsigned long inicio = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - inicio) < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConectado = true;
+      lcd.clear();
+      lcd.print("WiFi Conectado!");
+      Serial.println("WiFi Conectado!");
+      sincronizarHora();
+    } else {
+      wifiConectado = false;
+      lcd.clear();
+      lcd.print("Timeout WiFi");
+    }
+  } else {
+    wifiConectado = false;
+    lcd.clear();
+    lcd.print("Rede nao");
+    lcd.setCursor(0, 1);
+    lcd.print("encontrada");
+  }
+}
+
+void sincronizarHora() {
+  configTime(-3 * 3600, 0, "pool.ntp.org");
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    Serial.println("Hora sincronizada!");
+  }
+}
+
+bool ehNovoDia() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return false;
+  static int ultimoDia = -1;
+  if (timeinfo.tm_mday != ultimoDia) {
+    ultimoDia = timeinfo.tm_mday;
+    return true;
+  }
+  return false;
+}
+
+bool horarioPermitido() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return false;
+  int hora = timeinfo.tm_hour;
+  int minuto = timeinfo.tm_min;
+  int segundo = timeinfo.tm_sec;
+  int segundosAtuais = hora * 3600 + minuto * 60 + segundo;
+  int segundosInicio = HORA_INICIO * 3600 + MINUTO_INICIO * 60;
+  int segundosFim = HORA_FIM * 3600 + MINUTO_FIM * 60;
+  return (segundosAtuais >= segundosInicio && segundosAtuais <= segundosFim);
+}
+
+bool horarioFinalizado() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return false;
+  int hora = timeinfo.tm_hour;
+  int minuto = timeinfo.tm_min;
+  return (hora > HORA_FIM || (hora == HORA_FIM && minuto >= MINUTO_FIM));
+}
+
+void calcularIntervalo() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    intervaloMin = 30;
+    return;
+  }
+  
+  int horaAtual = timeinfo.tm_hour;
+  int minutoAtual = timeinfo.tm_min;
+  int segundoAtual = timeinfo.tm_sec;
+  int segundosAtuais = horaAtual * 3600 + minutoAtual * 60 + segundoAtual;
+  int segundosInicio = HORA_INICIO * 3600 + MINUTO_INICIO * 60;
+  int segundosFim = HORA_FIM * 3600 + MINUTO_FIM * 60;
+  
+  int segundosRestantes = segundosFim - segundosAtuais;
+  float minutosRestantes = segundosRestantes / 60.0;
+  
+  int leiturasRestantes = NUM_LEITURAS - contador;
+  if (leiturasRestantes > 0) {
+    intervaloMin = minutosRestantes / leiturasRestantes;
+  } else {
+    intervaloMin = 0;
+  }
+}
+
+void exibirIntervaloETotal() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+  
+  int horaAtual = timeinfo.tm_hour;
+  int minutoAtual = timeinfo.tm_min;
+  int segundoAtual = timeinfo.tm_sec;
+  int segundosAtuais = horaAtual * 3600 + minutoAtual * 60 + segundoAtual;
+  int segundosFim = HORA_FIM * 3600 + MINUTO_FIM * 60;
+  
+  int segundosRestantes = segundosFim - segundosAtuais;
+  float minutosRestantes = segundosRestantes / 60.0;
+  
+  lcd.clear();
+  lcd.print("Interv:");
+  lcd.print(intervaloMin, 0);
+  lcd.print("min");
+  
+  lcd.setCursor(0, 1);
+  lcd.print("Total:");
+  lcd.print(minutosRestantes, 0);
+  lcd.print("min");
+  
+  Serial.printf("Interv: %.0f min | Total: %.0f min | %d leituras | %d:%02d-%d:%02d\n", 
+                intervaloMin, minutosRestantes, contador, 
+                HORA_INICIO, MINUTO_INICIO, HORA_FIM, MINUTO_FIM);
+}
+
+void exibirRelogio() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+  
+  int hora = timeinfo.tm_hour;
+  int minuto = timeinfo.tm_min;
+  int segundo = timeinfo.tm_sec;
+  
+  lcd.clear();
+  lcd.print("Hora: ");
+  if (hora < 10) lcd.print("0");
+  lcd.print(hora);
+  lcd.print(":");
+  if (minuto < 10) lcd.print("0");
+  lcd.print(minuto);
+  lcd.print(":");
+  if (segundo < 10) lcd.print("0");
+  lcd.print(segundo);
+  
+  lcd.setCursor(0, 1);
+  switch(estadoAtual) {
+    case AGUARDANDO_INICIO:
+      lcd.print("Aguardando ");
+      lcd.print(HORA_INICIO);
+      lcd.print(":00");
+      break;
+    case EXIBINDO_INTERVALO:
+      lcd.print("Preparando...");
+      break;
+    case MEDINDO:
+      lcd.print("Medindo...");
+      break;
+    case EXIBINDO_MEDIA_FINAL:
+      lcd.print("Media Calculada!");
+      break;
+    case EXIBINDO_PAINEIS:
+      lcd.print("Estimativa Paineis");
+      break;
+    case HORARIO_FINALIZADO:
+      lcd.print("Finalizado ");
+      lcd.print(HORA_FIM);
+      lcd.print(":00");
+      break;
+  }
+}
+
+// ========== FUNÇÃO PARA ENVIAR TODOS OS DADOS PARA PLANILHA ==========
+void enviarParaPlanilha(float media, float energia, float energiaPequeno, float energiaMedio, float energiaGrande) {
+  if (wifiConectado) {
+    HTTPClient http;
+    http.begin(scriptURL);
+    http.addHeader("Content-Type", "application/json");
+
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+      Serial.println("Erro ao obter hora para planilha");
+      return;
+    }
+
+    char dataStr[12];
+    strftime(dataStr, sizeof(dataStr), "%d/%m/%Y", &timeinfo);
+    char horaStr[12];
+    strftime(horaStr, sizeof(horaStr), "%H:%M:%S", &timeinfo);
+
+    String jsonData = "{";
+    jsonData += "\"action\":\"escreverEmLista\",";
+    jsonData += "\"data\":\"" + String(dataStr) + "\",";
+    jsonData += "\"hora\":\"" + String(horaStr) + "\",";
+    jsonData += "\"energia_pequeno\":" + String(energiaPequeno, 4) + ",";  // COLUNA C
+    jsonData += "\"energia_medio\":" + String(energiaMedio, 4) + ",";     // COLUNA D
+    jsonData += "\"energia_grande\":" + String(energiaGrande, 4) + ",";   // COLUNA E
+    jsonData += "\"media\":" + String(media, 2) + ",";                    // COLUNA F
+    jsonData += "\"energia\":" + String(energia, 4);                      // COLUNA G
+    jsonData += "}";
+
+    Serial.println("Enviando dados completos para planilha:");
+    Serial.println(jsonData);
+
+    int httpCode = http.POST(jsonData);
+    if (httpCode > 0) {
+      Serial.printf("Enviado para planilha: %d\n", httpCode);
+      String response = http.getString();
+      Serial.println("Resposta: " + response);
+    } else {
+      Serial.printf("Erro ao enviar: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  }
+}
+
+float lerFotodiodoMelhorado() {
+  int amostras = 15;
+  long soma = 0;
+  for (int i = 0; i < amostras; i++) {
+    soma += analogRead(fotoDiodoPIN);
+    delay(10);
+  }
+  int leituraMedia = soma / amostras;
+  float tensao = (leituraMedia / 4095.0) * 3.3;
+  float irrad = tensao * fatorCalibracao * 1000.0;
+  
+  if (irrad < 0) irrad = 0;
+  
+  return irrad;
+}
+
+//  FUNÇÃO QUE EXIBE ESTIMATIVA DOS PAINÉIS 
+void exibirEstimativaPaineis(float media) {
+  unsigned long tempoAtual = millis();
+  
+  if (!paineisExibidos) {
+    paineisExibidos = true;
+    painelAtual = 0;
+    tempoExibicaoPainel = tempoAtual;
+    Serial.println("Iniciando exibicao dos paineis");
+  }
+  
+  // Calcula tempo real entre 8:00 e 16:00
+  float tempoHoras = ((HORA_FIM * 60 + MINUTO_FIM) - (HORA_INICIO * 60 + MINUTO_INICIO)) / 60.0;
+  
+  // Define os tamanhos dos painéis (em m²)
+  float areaPequeno = 1.0;   // 1m²
+  float areaMedio = 2.5;     // 2.5m²  
+  float areaGrande = 5.0;    // 5m²
+  
+  // Calcula energia para cada painel
+  float energiaPequeno = (media * tempoHoras * areaPequeno) / 1000.0;
+  float energiaMedio = (media * tempoHoras * areaMedio) / 1000.0;
+  float energiaGrande = (media * tempoHoras * areaGrande) / 1000.0;
+  
+  // Alterna entre os painéis a cada minuto
+  if (tempoAtual - tempoExibicaoPainel >= TEMPO_EXIBICAO_PAINEL) {
+    painelAtual++;
+    tempoExibicaoPainel = tempoAtual;
+    
+    if (painelAtual > 2) {
+      // Todos os painéis foram exibidos, volta para estado final
+      estadoAtual = HORARIO_FINALIZADO;
+      paineisExibidos = false;
+      Serial.println("Todos os paineis foram exibidos");
+      return;
+    }
+  }
+  
+  // Exibe o painel atual
+  lcd.clear();
+  switch(painelAtual) {
+    case 0: // Painel Pequeno
+      lcd.print("IRRAD:");
+      lcd.print(media, 1);
+      lcd.print("W/m2");
+      lcd.setCursor(0, 1);
+      lcd.print("EST.PEQ:");
+      lcd.print(energiaPequeno, 3);
+      lcd.print("kWh");
+      break;
+      
+    case 1: // Painel Médio
+      lcd.print("IRRAD:");
+      lcd.print(media, 1);
+      lcd.print("W/m2");
+      lcd.setCursor(0, 1);
+      lcd.print("EST.MED:");
+      lcd.print(energiaMedio, 3);
+      lcd.print("kWh");
+      break;
+      
+    case 2: // Painel Grande
+      lcd.print("IRRAD:");
+      lcd.print(media, 1);
+      lcd.print("W/m2");
+      lcd.setCursor(0, 1);
+      lcd.print("EST.GRA:");
+      lcd.print(energiaGrande, 3);
+      lcd.print("kWh");
+      break;
+  }
+  
+  Serial.printf("Painel %d - Energia: %.3f kWh\n", painelAtual + 1, 
+                (painelAtual == 0) ? energiaPequeno : (painelAtual == 1) ? energiaMedio : energiaGrande);
+}
+
+//  FUNÇÃO QUE CALCULA A MÉDIA FINAL 
+void calcularMediaFinal() {
+  Serial.println("=== INICIANDO CALCULO DA MEDIA ===");
+  
+  if (contador == 0) {
+    Serial.println("Nenhuma leitura para calcular media!");
+    lcd.clear();
+    lcd.print("Sem leituras");
+    lcd.setCursor(0, 1);
+    lcd.print("para calcular");
+    delay(5000);
+    return;
+  }
+  
+  //  CALCULA MÉDIA DIVIDINDO POR 10 (mesmo com 11 leituras) 
+  float media = soma_irradiacao / 10;
+  
+  //  CORREÇÃO: Calcula tempo real entre 8:00 e 16:00 
+  float tempoMinutos = (HORA_FIM * 60 + MINUTO_FIM) - (HORA_INICIO * 60 + MINUTO_INICIO);
+  float tempoHoras = tempoMinutos / 60.0;
+  float energia = (media * tempoHoras) / 1000.0;
+
+  //  CALCULA ENERGIA DOS PAINÉIS 
+  float areaPequeno = 1.0;   // 1m²
+  float areaMedio = 2.5;     // 2.5m²  
+  float areaGrande = 5.0;    // 5m²
+  
+  float energiaPequeno = (media * tempoHoras * areaPequeno) / 1000.0;
+  float energiaMedio = (media * tempoHoras * areaMedio) / 1000.0;
+  float energiaGrande = (media * tempoHoras * areaGrande) / 1000.0;
+
+  // Muda para estado de exibição da média
+  estadoAtual = EXIBINDO_MEDIA_FINAL;
+  tempoEstadoInicio = millis();
+  
+  // MOSTRA A MÉDIA NO LCD
+  lcd.clear();
+  lcd.print("Media:");
+  lcd.print(media, 1);
+  lcd.print("W/m2");
+  lcd.setCursor(0, 1);
+  lcd.print("Energia:");
+  lcd.print(energia, 4);
+  lcd.print("kWh");
+
+  //  DETALHES NO SERIAL MONITOR 
+  Serial.println("=== MEDIA FINAL CALCULADA ===");
+  Serial.printf("Total de leituras: %d\n", contador);
+  Serial.printf("SOMA TOTAL de todas leituras: %.1f W\n", soma_irradiacao);
+  Serial.printf("MEDIA (Soma ÷ 10): %.1f W/m2\n", media);
+  Serial.printf("Tempo: %.2f horas (%d min - %d:%02d-%d:%02d)\n", 
+                tempoHoras, (int)tempoMinutos, HORA_INICIO, MINUTO_INICIO, HORA_FIM, MINUTO_FIM);
+  Serial.printf("Energia gerada: %.4f kWh/m2\n", energia);
+  Serial.printf("Painel Pequeno (1m²): %.4f kWh\n", energiaPequeno);
+  Serial.printf("Painel Medio (2.5m²): %.4f kWh\n", energiaMedio);
+  Serial.printf("Painel Grande (5m²): %.4f kWh\n", energiaGrande);
+  
+  Serial.println("Leituras realizadas:");
+  for (int i = 0; i < contador; i++) {
+    Serial.printf("Leitura %d: %.1f W\n", i+1, leituras[i]);
+  }
+  Serial.println("=======================");
+
+  if (wifiConectado) {
+    Blynk.virtualWrite(V0, media);
+    Blynk.virtualWrite(V3, energia);
+    Blynk.run();
+    
+    //  ENVIA TODOS OS DADOS PARA A PLANILHA 
+    enviarParaPlanilha(media, energia, energiaPequeno, energiaMedio, energiaGrande);
+    Serial.println("Dados enviados para Blynk e Planilha!");
+  }
+  
+  cicloConcluidoHoje = true;
+  Serial.println("Media sera exibida por 10 segundos...");
+}
+
+//  FUNÇÃO QUE FAZ A LEITURA E SOMA 
+void medirIrradiacao() {
+  if (estadoAtual != MEDINDO) return;
+  
+  // Verifica se horário finalizado
+  if (horarioFinalizado()) {
+    Serial.println("Horario finalizado - calculando media...");
+    calcularMediaFinal();
+    return;
+  }
+  
+  // Verifica se completou todas as leituras
+  if (contador >= NUM_LEITURAS) {
+    Serial.println("11 leituras completas - calculando media...");
+    calcularMediaFinal();
+    return;
+  }
+  
+  //  FAZ A LEITURA DO SENSOR 
+  float irrad = lerFotodiodoMelhorado();
+
+  if (irrad > 600.0) {
+    digitalWrite(ledPin, HIGH);
+    Serial.println(">>> LED ACESO - Excelente irradiacao!");
+  } else {
+    digitalWrite(ledPin, LOW);
+  }
+
+  //  AQUI ACONTECE A SOMA DAS LEITURAS 
+  if (contador < NUM_LEITURAS) {
+    leituras[contador] = irrad;
+    soma_irradiacao += irrad;
+    contador++;
+
+    //  MOSTRA NO SERIAL A SOMA ATUAL 
+    Serial.printf("Leitura %d: %.1f W | SOMA ATUAL: %.1f W\n", contador, irrad, soma_irradiacao);
+
+    // Recalcula intervalo para próxima leitura
+    calcularIntervalo();
+    
+    // Agenda próxima leitura
+    if (contador < NUM_LEITURAS) {
+      proximaLeitura = millis() + (unsigned long)(intervaloMin * 60000);
+    }
+  }
+
+  // Exibe no LCD - MOSTRA APENAS ATÉ 10 NO DISPLAY
+  lcd.clear();
+  lcd.print("Irrad:");
+  lcd.print(irrad, 1);
+  lcd.print("W/m2");
+  lcd.setCursor(0, 1);
+  lcd.print("L:");
+  
+  //  MOSTRA APENAS ATÉ 10 NO DISPLAY, MESMO TENDO 11 LEITURAS 
+  if (contador <= NUM_LEITURAS_DISPLAY) {
+    lcd.print(contador);
+    lcd.print("/");
+    lcd.print(NUM_LEITURAS_DISPLAY);
+  } else {
+    // Quando chegar na 11ª leitura, mostra "10/10" no display
+    lcd.print(NUM_LEITURAS_DISPLAY);
+    lcd.print("/");
+    lcd.print(NUM_LEITURAS_DISPLAY);
+  }
+  
+  lcd.print(" I:");
+  lcd.print(intervaloMin, 1);
+  lcd.print("m");
+
+  if (wifiConectado) {
+    Blynk.virtualWrite(V1, irrad);
+    Blynk.virtualWrite(V2, contador);
+    Blynk.run();
+  }
+}
+
+//  FUNÇÃO PRINCIPAL DE CONTROLE DE ESTADO 
+void gerenciarEstados() {
+  unsigned long tempoAtual = millis();
+  
+  switch(estadoAtual) {
+    case AGUARDANDO_INICIO:
+      if (horarioPermitido() && !cicloConcluidoHoje) {
+        // Inicia o processo mostrando intervalo primeiro
+        estadoAtual = EXIBINDO_INTERVALO;
+        tempoEstadoInicio = tempoAtual;
+        calcularIntervalo();
+        exibirIntervaloETotal();
+        Serial.println("Exibindo intervalo por 10 segundos...");
+      }
+      break;
+      
+    case EXIBINDO_INTERVALO:
+      if (tempoAtual - tempoEstadoInicio >= TEMPO_EXIBICAO_INTERVALO) {
+        // Termina exibição do intervalo e começa a medir
+        estadoAtual = MEDINDO;
+        medicaoAtiva = true;
+        calcularIntervalo();
+        proximaLeitura = tempoAtual; // Primeira leitura imediata
+        Serial.println("Fim da exibicao do intervalo - INICIANDO MEDICOES");
+      } else {
+        // Atualiza display do intervalo a cada 5 segundos
+        static unsigned long ultimaAtualizacao = 0;
+        if (tempoAtual - ultimaAtualizacao >= 5000) {
+          exibirIntervaloETotal();
+          ultimaAtualizacao = tempoAtual;
+        }
+      }
+      break;
+      
+    case MEDINDO:
+      // Verifica se é hora da próxima leitura
+      if (tempoAtual >= proximaLeitura) {
+        medirIrradiacao();
+      }
+      
+      // Verifica condições de término
+      if (contador >= NUM_LEITURAS || horarioFinalizado()) {
+        calcularMediaFinal();
+      }
+      break;
+      
+    case EXIBINDO_MEDIA_FINAL:
+      if (tempoAtual - tempoEstadoInicio >= TEMPO_EXIBICAO_MEDIA) {
+        // Após exibir média, mostra os painéis
+        estadoAtual = EXIBINDO_PAINEIS;
+        float media = soma_irradiacao / 10;
+        exibirEstimativaPaineis(media);
+        Serial.println("Iniciando exibicao dos paineis...");
+      } else {
+        // Atualiza display da média com relógio
+        static unsigned long ultimaAtualizacao = 0;
+        if (tempoAtual - ultimaAtualizacao >= 1000) {
+          struct tm timeinfo;
+          if (getLocalTime(&timeinfo)) {
+            float media = soma_irradiacao / 10;
+            float tempoMinutos = (HORA_FIM * 60 + MINUTO_FIM) - (HORA_INICIO * 60 + MINUTO_INICIO);
+            float energia = (media * (tempoMinutos / 60.0)) / 1000.0;
+            
+            lcd.clear();
+            lcd.print("M:");
+            lcd.print(media, 1);
+            lcd.print("W E:");
+            lcd.print(energia, 3);
+            lcd.print("k");
+            
+            lcd.setCursor(0, 1);
+            lcd.print("Hora:");
+            lcd.print(timeinfo.tm_hour);
+            lcd.print(":");
+            if (timeinfo.tm_min < 10) lcd.print("0");
+            lcd.print(timeinfo.tm_min);
+            lcd.print(":");
+            if (timeinfo.tm_sec < 10) lcd.print("0");
+            lcd.print(timeinfo.tm_sec);
+          }
+          ultimaAtualizacao = tempoAtual;
+        }
+      }
+      break;
+      
+    case EXIBINDO_PAINEIS:
+      // Gerencia a exibição dos painéis
+      if (estadoAtual == EXIBINDO_PAINEIS) {
+        float media = soma_irradiacao / 10;
+        exibirEstimativaPaineis(media);
+      }
+      break;
+      
+    case HORARIO_FINALIZADO:
+      // Mantém exibindo relógio até o próximo dia
+      break;
+  }
+}
+
+void setup() {
+  pinMode(fotoDiodoPIN, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+  
+  Serial.begin(115200);
+  Serial.println("=== SISTEMA SOLAR COMPLETO INICIADO ===");
+  Serial.printf("Horario: %d:%02d - %d:%02d\n", HORA_INICIO, MINUTO_INICIO, HORA_FIM, MINUTO_FIM);
+  Serial.printf("Total de leituras: %d (display mostra até %d)\n", NUM_LEITURAS, NUM_LEITURAS_DISPLAY);
+  
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Iniciando...");
+  delay(2000);
+  
+  conectarWiFiRapido();
+  
+  if (wifiConectado) {
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    if (Blynk.connect(5000)) {
+      Serial.println("Blynk conectado!");
+    } else {
+      Serial.println("Blynk nao conectado, mas sistema funciona");
+    }
+  }
+  
+  estadoAtual = AGUARDANDO_INICIO;
+}
+
+void loop() {
+  if (!wifiConectado) {
+    conectarWiFiRapido();
+  } else {
+    Blynk.run();
+  }
+
+  // Reset do sistema para novo dia
+  if (ehNovoDia()) {
+    cicloConcluidoHoje = false;
+    contador = 0;
+    soma_irradiacao = 0.0;
+    paineisExibidos = false;
+    estadoAtual = AGUARDANDO_INICIO;
+    Serial.println("=== NOVO DIA - SISTEMA RESETADO ===");
+  }
+
+  // Gerencia os estados do sistema
+  gerenciarEstados();
+
+  // Atualiza relógio periodicamente (exceto durante medições ativas)
+  static unsigned long ultimaAtualizacaoRelogio = 0;
+  if (millis() - ultimaAtualizacaoRelogio >= 1000) {
+    if (estadoAtual == AGUARDANDO_INICIO || estadoAtual == HORARIO_FINALIZADO) {
+      exibirRelogio();
+    }
+    ultimaAtualizacaoRelogio = millis();
+  }
+  
+  delay(100);
+}
+
+BLYNK_CONNECTED() {
+  Serial.println("Blynk conectado!");
+  Blynk.virtualWrite(V0, 0);
+  Blynk.virtualWrite(V1, 0);
+  Blynk.virtualWrite(V2, 0);
+  Blynk.virtualWrite(V3, 0);
+}
