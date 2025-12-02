@@ -1,0 +1,1336 @@
+// ========== SISTEMA SOLAR COMPLETO - MODO HÍBRIDO ==========
+#define BLYNK_PRINT Serial
+#define BLYNK_TEMPLATE_ID "TMPL2CBALClFp"
+#define BLYNK_TEMPLATE_NAME "esp32fotodiodo"
+#define BLYNK_AUTH_TOKEN "Kfv6XpxuG-Hjuu6hHZg-DEfLEXDlHosV"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <HTTPClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <time.h>
+
+// ----------- CONFIGURAÇÕES ATUALIZADAS -----------
+#define HORA_INICIO 8
+#define MINUTO_INICIO 0
+#define HORA_FIM 16
+#define MINUTO_FIM 0
+#define NUM_LEITURAS 10
+#define NUM_LEITURAS_DISPLAY 10
+
+// ----------- BOTÕES -----------
+#define BOTAO_PAUSA 14
+#define BOTAO_RESET_WIFI 13
+
+// ----------- REDES WI-FI -----------
+struct Rede {
+  const char* ssid;
+  const char* senha;
+};
+Rede redes[] = {
+  {"Sakaninha wifi", "sgzq3535"},
+  {"brisa-1458023", "ppmxwzb6"},  
+  {"LUANA", "Luana1004@"},
+  {"JOAO", "JoaoVitor"},
+  {"EDUC-VISITANTES","visitante"}
+};
+const int totalRedes = sizeof(redes) / sizeof(redes[0]);
+
+// ----------- PINOS E VARIAVEIS -----------
+const int fotoDiodoPIN = 33;
+const int ledPin = 12;
+float fatorCalibracao = 1.4;
+float limiteAlerta = 600.0;
+
+// VARIÁVEIS PARA SOMA E MÉDIA 
+float soma_irradiacao = 0.0;
+float leituras[NUM_LEITURAS];
+int contador = 0;
+float intervaloMin = 0;
+unsigned long proximaLeitura = 0;
+bool medicaoAtiva = false;
+bool cicloConcluidoHoje = false;
+bool wifiConectado = false;
+bool blynkConectado = false;
+
+// VARIÁVEIS PARA PAINÉIS SOLARES 
+bool paineisExibidos = false;
+unsigned long tempoExibicaoPainel = 0;
+int painelAtual = 0;
+
+// VARIÁVEIS DE CONTROLE DE ESTADO 
+enum EstadoSistema {
+  AGUARDANDO_INICIO,
+  EXIBINDO_INTERVALO,
+  MEDINDO,
+  EXIBINDO_MEDIA_FINAL,
+  EXIBINDO_PAINEIS,
+  HORARIO_FINALIZADO
+};
+EstadoSistema estadoAtual = AGUARDANDO_INICIO;
+
+// VARIÁVEIS PARA BOTÕES E CONTROLES
+bool sistemaPausado = false;
+bool ultimoEstadoPausa = HIGH;
+bool ultimoEstadoReset = HIGH;
+unsigned long tempoPausaInicio = 0;
+unsigned long tempoPausaAcumulado = 0;
+int leituraPausada = 0;
+bool enviouAlerta = false;
+bool verificouAlerta = false;
+
+// VARIÁVEIS PARA CONTROLE DE TEMPO DE PAUSA
+unsigned long tempoRestanteLeitura = 0;
+bool ajustouIntervalos = false;
+
+// VARIÁVEIS PARA MODO HÍBRIDO
+struct DadosDia {
+  char data[12];
+  float media;
+  float energia;
+  float energiaPequeno;
+  float energiaMedio;
+  float energiaGrande;
+  bool enviado;
+};
+DadosDia dadosAtuais;
+bool dadosPendentes = false;
+
+// VARIÁVEIS DE CONTROLE DE ENVIO
+bool tentarEnvioPendentes = false;
+static bool tentouEnviarPendentes = false;
+static unsigned long ultimoResetEnvio = 0;
+
+// VARIÁVEIS PARA CONTROLE DE TEMPO OFFLINE
+unsigned long inicioDiaMillis = 0;
+bool tempoOfflineCalculado = false;
+unsigned long ultimaSincronizacao = 0;
+
+// Período do dia em milissegundos (8 horas)
+const unsigned long PERIODO_DIA_MILLIS = (8 * 3600 * 1000);
+const float TEMPO_HORAS_OPERACAO = 8.0; // 8 horas em horas
+
+unsigned long tempoEstadoInicio = 0;
+const unsigned long TEMPO_EXIBICAO_INTERVALO = 10000;
+const unsigned long TEMPO_EXIBICAO_MEDIA = 10000;
+const unsigned long TEMPO_EXIBICAO_PAINEL = 60000;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+BlynkTimer timer;
+
+// ========== LINK ATUALIZADO DO GOOGLE APPS SCRIPT ==========
+const char* scriptURL = "https://script.google.com/macros/s/AKfycbzcM7EUsXtM2i7rbE3tDCt4zeFOIMoaq9wXFDM00qHMD1efCWsQ3TUjSTe3lY6w29DSyw/exec";
+
+// ========== CONEXAO WI-FI ==========
+void conectarWiFiRapido() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConectado = true;
+    
+    if (!blynkConectado) {
+      Serial.println("Tentando reconectar Blynk...");
+      if (Blynk.connect(5000)) {
+        blynkConectado = true;
+        Serial.println("Blynk reconectado!");
+        
+        if (contador > 0) {
+          Serial.println("Reenviando dados atuais para Blynk...");
+          Blynk.virtualWrite(V0, soma_irradiacao / 10);
+          Blynk.virtualWrite(V1, leituras[contador-1]);
+          Blynk.virtualWrite(V2, contador);
+          Blynk.virtualWrite(V3, (soma_irradiacao / 10) * TEMPO_HORAS_OPERACAO / 1000.0);
+          Blynk.run();
+          Serial.println("Dados do Blynk atualizados!");
+        }
+      }
+    }
+    
+    if (dadosPendentes && tentarEnvioPendentes) {
+      Serial.println("WiFi conectado - tentando enviar dados pendentes...");
+      tentarEnviarDadosPendentes();
+    }
+    
+    sincronizarHora();
+    return;
+  }
+  
+  lcd.clear();
+  lcd.print("Procurando WiFi");
+  
+  Serial.println("Escaneando redes...");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    lcd.setCursor(0, 1);
+    lcd.print("Nenhuma rede");
+    wifiConectado = false;
+    blynkConectado = false;
+    return;
+  }
+  
+  String melhorRede = "";
+  String melhorSenha = "";
+  int melhorForca = -1000;
+  
+  for (int i = 0; i < n; i++) {
+    String ssidScan = WiFi.SSID(i);
+    int forca = WiFi.RSSI(i);
+    
+    for (int j = 0; j < totalRedes; j++) {
+      if (ssidScan == redes[j].ssid) {
+        if (forca > melhorForca) {
+          melhorForca = forca;
+          melhorRede = redes[j].ssid;
+          melhorSenha = redes[j].senha;
+        }
+      }
+    }
+  }
+  
+  if (melhorRede != "") {
+    lcd.clear();
+    lcd.print("Conectando:");
+    lcd.setCursor(0, 1);
+    lcd.print(melhorRede);
+    
+    WiFi.begin(melhorRede.c_str(), melhorSenha.c_str());
+    
+    unsigned long inicio = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - inicio) < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConectado = true;
+      lcd.clear();
+      lcd.print("WiFi Conectado!");
+      Serial.println("WiFi Conectado!");
+      sincronizarHora();
+      
+      if (dadosPendentes && tentarEnvioPendentes) {
+        Serial.println("Conexao estabelecida - tentando enviar dados pendentes...");
+        tentarEnviarDadosPendentes();
+      }
+      
+      Serial.println("Conectando Blynk...");
+      Blynk.config(BLYNK_AUTH_TOKEN);
+      if (Blynk.connect(5000)) {
+        blynkConectado = true;
+        Serial.println("Blynk conectado!");
+        
+        if (contador > 0) {
+          Serial.println("Reenviando dados atuais para Blynk...");
+          Blynk.virtualWrite(V0, soma_irradiacao / 10);
+          Blynk.virtualWrite(V1, leituras[contador-1]);
+          Blynk.virtualWrite(V2, contador);
+          Blynk.virtualWrite(V3, (soma_irradiacao / 10) * TEMPO_HORAS_OPERACAO / 1000.0);
+          Blynk.run();
+          Serial.println("Dados do Blynk atualizados!");
+        } else {
+          Blynk.virtualWrite(V0, 0);
+          Blynk.virtualWrite(V1, 0);
+          Blynk.virtualWrite(V2, 0);
+          Blynk.virtualWrite(V3, 0);
+        }
+      } else {
+        blynkConectado = false;
+        Serial.println("Blynk nao conectado, mas sistema funciona");
+      }
+    } else {
+      wifiConectado = false;
+      blynkConectado = false;
+      lcd.clear();
+      lcd.print("Timeout WiFi");
+      delay(1000);
+    }
+  } else {
+    wifiConectado = false;
+    blynkConectado = false;
+    lcd.clear();
+    lcd.print("Rede nao");
+    lcd.setCursor(0, 1);
+    lcd.print("encontrada");
+    delay(1000);
+  }
+}
+
+void sincronizarHora() {
+  configTime(-3 * 3600, 0, "pool.ntp.org");
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    Serial.println("Hora sincronizada!");
+    ultimaSincronizacao = millis();
+    
+    if (inicioDiaMillis == 0 && horarioPermitido()) {
+      inicioDiaMillis = millis();
+      tempoOfflineCalculado = false;
+      Serial.println("Inicio do dia marcado pelo horario sincronizado");
+    }
+  }
+}
+
+// ========== SISTEMA DE HORÁRIO OFFLINE ==========
+bool ehNovoDia() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    static unsigned long ultimoReset = 0;
+    if (millis() - ultimoReset > 86400000) {
+      ultimoReset = millis();
+      inicioDiaMillis = 0;
+      tempoOfflineCalculado = false;
+      Serial.println("=== NOVO DIA OFFLINE ===");
+      return true;
+    }
+    return false;
+  }
+  
+  static int ultimoDia = -1;
+  if (timeinfo.tm_mday != ultimoDia) {
+    ultimoDia = timeinfo.tm_mday;
+    enviouAlerta = false;
+    verificouAlerta = false;
+    inicioDiaMillis = 0;
+    tempoOfflineCalculado = false;
+    
+    if (dadosPendentes) {
+      tentarEnviarDadosPendentes();
+    }
+    
+    Serial.println("=== NOVO DIA ONLINE ===");
+    return true;
+  }
+  return false;
+}
+
+bool horarioPermitido() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    if (inicioDiaMillis == 0) {
+      inicioDiaMillis = millis();
+      Serial.println("Inicio do dia assumido (offline)");
+    }
+    
+    unsigned long tempoDecorrido = millis() - inicioDiaMillis;
+    
+    return (tempoDecorrido <= PERIODO_DIA_MILLIS);
+  }
+  
+  int hora = timeinfo.tm_hour;
+  int minuto = timeinfo.tm_min;
+  int segundo = timeinfo.tm_sec;
+  int segundosAtuais = hora * 3600 + minuto * 60 + segundo;
+  int segundosInicio = HORA_INICIO * 3600 + MINUTO_INICIO * 60;
+  int segundosFim = HORA_FIM * 3600 + MINUTO_FIM * 60;
+  
+  if (segundosFim <= segundosInicio) {
+    segundosFim += 24 * 3600;
+    if (segundosAtuais < segundosInicio) {
+      segundosAtuais += 24 * 3600;
+    }
+  }
+  
+  return (segundosAtuais >= segundosInicio && segundosAtuais <= segundosFim);
+}
+
+bool horarioFinalizado() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    if (inicioDiaMillis == 0) return false;
+    
+    unsigned long tempoDecorrido = millis() - inicioDiaMillis;
+    
+    return (tempoDecorrido >= PERIODO_DIA_MILLIS);
+  }
+  
+  int hora = timeinfo.tm_hour;
+  int minuto = timeinfo.tm_min;
+  int segundo = timeinfo.tm_sec;
+  int segundosAtuais = hora * 3600 + minuto * 60 + segundo;
+  int segundosFim = HORA_FIM * 3600 + MINUTO_FIM * 60;
+  
+  return (hora > HORA_FIM || (hora == HORA_FIM && minuto >= MINUTO_FIM));
+}
+
+bool passouDaHoraFinal() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return false;
+  }
+  
+  int hora = timeinfo.tm_hour;
+  int minuto = timeinfo.tm_min;
+  
+  return (hora >= HORA_FIM && minuto >= MINUTO_FIM);
+}
+
+// ========== FUNÇÃO CALCULAR INTERVALO DINÂMICO ==========
+void calcularIntervalo() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    if (inicioDiaMillis == 0) {
+      intervaloMin = (PERIODO_DIA_MILLIS / 60000.0) / NUM_LEITURAS;
+      Serial.printf("OFFLINE - Intervalo inicial: %.1f min\n", intervaloMin);
+      return;
+    }
+    
+    unsigned long tempoDecorrido = millis() - inicioDiaMillis;
+    
+    if (tempoDecorrido >= PERIODO_DIA_MILLIS) {
+      intervaloMin = 0;
+      Serial.println("OFFLINE - Horario finalizado");
+      return;
+    }
+    
+    unsigned long tempoRestanteMillis = PERIODO_DIA_MILLIS - tempoDecorrido;
+    float minutosRestantes = tempoRestanteMillis / 60000.0;
+    
+    int leiturasRestantes = NUM_LEITURAS - contador;
+    
+    Serial.printf("OFFLINE - Tempo decorrido: %lu min | Restante: %.1f min | Leituras restantes: %d\n", 
+                  tempoDecorrido / 60000, minutosRestantes, leiturasRestantes);
+    
+    if (leiturasRestantes > 0 && minutosRestantes > 0) {
+      if (leiturasRestantes == 1) {
+        intervaloMin = minutosRestantes;
+        Serial.printf("OFFLINE - ULTIMA LEITURA: Intervalo = tempo restante = %.1f min\n", intervaloMin);
+      } else {
+        intervaloMin = minutosRestantes / leiturasRestantes;
+        Serial.printf("OFFLINE - Leituras restantes: %d | Intervalo calculado: %.1f min\n", 
+                      leiturasRestantes, intervaloMin);
+      }
+    } else {
+      intervaloMin = 0;
+    }
+    
+    if (intervaloMin < 1.0 && intervaloMin > 0 && leiturasRestantes > 1) {
+      intervaloMin = 1.0;
+      Serial.println("OFFLINE - Intervalo ajustado para minimo de 1 minuto");
+    }
+    
+    Serial.printf("OFFLINE - Intervalo final: %.1f min\n", intervaloMin);
+    return;
+  }
+  
+  int horaAtual = timeinfo.tm_hour;
+  int minutoAtual = timeinfo.tm_min;
+  int segundoAtual = timeinfo.tm_sec;
+  int segundosAtuais = horaAtual * 3600 + minutoAtual * 60 + segundoAtual;
+  int segundosInicio = HORA_INICIO * 3600 + MINUTO_INICIO * 60;
+  int segundosFim = HORA_FIM * 3600 + MINUTO_FIM * 60;
+  
+  Serial.printf("ONLINE - Hora atual: %02d:%02d:%02d | Inicio: %02d:%02d | Fim: %02d:%02d\n", 
+                horaAtual, minutoAtual, segundoAtual, HORA_INICIO, MINUTO_INICIO, HORA_FIM, MINUTO_FIM);
+  
+  if (segundosFim <= segundosInicio) {
+    segundosFim += 24 * 3600;
+    if (segundosAtuais < segundosInicio) {
+      segundosAtuais += 24 * 3600;
+    }
+  }
+  
+  int segundosRestantes = segundosFim - segundosAtuais;
+  float minutosRestantes = segundosRestantes / 60.0;
+  
+  int leiturasRestantes = NUM_LEITURAS - contador;
+  
+  Serial.printf("ONLINE - Minutos restantes: %.1f | Leituras restantes: %d\n", 
+                minutosRestantes, leiturasRestantes);
+  
+  if (leiturasRestantes > 0 && minutosRestantes > 0) {
+    if (leiturasRestantes == 1) {
+      intervaloMin = minutosRestantes;
+      Serial.printf("ONLINE - ULTIMA LEITURA: Intervalo = tempo restante = %.1f min\n", intervaloMin);
+    } else {
+      intervaloMin = minutosRestantes / leiturasRestantes;
+      Serial.printf("ONLINE - Leituras restantes: %d | Intervalo calculado: %.1f min\n", 
+                    leiturasRestantes, intervaloMin);
+    }
+  } else {
+    intervaloMin = 0;
+  }
+  
+  if (intervaloMin < 1.0 && intervaloMin > 0 && leiturasRestantes > 1) {
+    intervaloMin = 1.0;
+    Serial.println("ONLINE - Intervalo ajustado para minimo de 1 minuto");
+  }
+  
+  Serial.printf("ONLINE - Intervalo final: %.1f min\n", intervaloMin);
+}
+
+// ========== SISTEMA DE PAUSA CORRIGIDO ==========
+void controlarPausa() {
+  bool estadoAtualPausa = digitalRead(BOTAO_PAUSA);
+  
+  if (estadoAtualPausa == LOW && ultimoEstadoPausa == HIGH) {
+    delay(50);
+    if (digitalRead(BOTAO_PAUSA) == LOW) {
+      
+      sistemaPausado = !sistemaPausado;
+      
+      if (sistemaPausado) {
+        tempoPausaInicio = millis();
+        leituraPausada = contador;
+        
+        if (contador < NUM_LEITURAS && proximaLeitura > millis()) {
+          tempoRestanteLeitura = proximaLeitura - millis();
+          Serial.printf("PAUSA ATIVADA - Leitura %d | Tempo restante: %lu ms | Intervalo: %.1f min\n", 
+                        leituraPausada, tempoRestanteLeitura, intervaloMin);
+        } else {
+          tempoRestanteLeitura = 0;
+        }
+        
+        lcd.clear();
+        lcd.print("SISTEMA PAUSADO");
+        lcd.setCursor(0, 1);
+        lcd.print("Leitura: ");
+        lcd.print(leituraPausada + 1);
+        Serial.println("=== SISTEMA PAUSADO ===");
+        
+      } else {
+        unsigned long tempoPausado = millis() - tempoPausaInicio;
+        Serial.printf("RETOMANDO - Pausa durou: %lu ms | Leitura retomada: %d\n", 
+                      tempoPausado, leituraPausada + 1);
+        
+        if (estadoAtual != MEDINDO && contador < NUM_LEITURAS) {
+          estadoAtual = MEDINDO;
+          Serial.println("ESTADO FORCADO PARA: MEDINDO");
+        }
+        
+        if (tempoRestanteLeitura > 0) {
+          proximaLeitura = millis() + tempoRestanteLeitura;
+          Serial.printf("CONTINUANDO leitura %d com tempo restante: %lu ms (%.1f min)\n", 
+                        leituraPausada + 1, tempoRestanteLeitura, tempoRestanteLeitura / 60000.0);
+        } else {
+          proximaLeitura = millis();
+          Serial.println("Leitura IMEDIATA - sem tempo restante");
+        }
+        
+        lcd.clear();
+        lcd.print("SISTEMA ATIVO");
+        lcd.setCursor(0, 1);
+        lcd.print("Retomando...");
+        
+        Serial.println("=== SISTEMA RETOMADO ===");
+        
+        delay(1000);
+      }
+    }
+  }
+  ultimoEstadoPausa = estadoAtualPausa;
+}
+
+// ========== BOTÃO WIFI CORRIGIDO ==========
+void controlarResetWifi() {
+  bool estadoAtualReset = digitalRead(BOTAO_RESET_WIFI);
+  
+  if (estadoAtualReset == LOW && ultimoEstadoReset == HIGH) {
+    delay(50);
+    if (digitalRead(BOTAO_RESET_WIFI) == LOW) {
+      
+      Serial.println("=== BOTAO RESET WIFI PRESSIONADO ===");
+      
+      unsigned long tempoRestanteAtual = 0;
+      if (contador < NUM_LEITURAS && proximaLeitura > millis()) {
+        tempoRestanteAtual = proximaLeitura - millis();
+        Serial.printf("Tempo restante atual: %lu ms\n", tempoRestanteAtual);
+      }
+      
+      lcd.clear();
+      lcd.print("REINICIANDO WIFI");
+      lcd.setCursor(0, 1);
+      lcd.print("Aguarde...");
+      
+      if (dadosPendentes) {
+        tentarEnvioPendentes = true;
+        Serial.println("Marcado para reenviar dados pendentes apos reconexao");
+      }
+      
+      if (blynkConectado) {
+        Blynk.disconnect();
+        delay(500);
+        blynkConectado = false;
+        Serial.println("Blynk desconectado");
+      }
+      
+      WiFi.disconnect(true);
+      delay(1000);
+      WiFi.mode(WIFI_OFF);
+      delay(500);
+      WiFi.mode(WIFI_STA);
+      delay(500);
+      
+      wifiConectado = false;
+      blynkConectado = false;
+      
+      Serial.println("WiFi completamente resetado");
+      
+      conectarWiFiRapido();
+      
+      if (tempoRestanteAtual > 0) {
+        proximaLeitura = millis() + tempoRestanteAtual;
+        Serial.printf("Tempo restante restaurado: %lu ms\n", tempoRestanteAtual);
+      } else {
+        calcularIntervalo();
+        if (intervaloMin > 0 && contador < NUM_LEITURAS) {
+          proximaLeitura = millis() + (unsigned long)(intervaloMin * 60000);
+          Serial.printf("Novo intervalo calculado: %.1f min\n", intervaloMin);
+        }
+      }
+      
+      lcd.clear();
+      if (wifiConectado) {
+        lcd.print("WIFI RECONECTADO");
+        Serial.println("WiFi reconectado com sucesso!");
+        
+        if (dadosPendentes) {
+          Serial.println("Tentando enviar dados pendentes apos reconexao...");
+          tentarEnviarDadosPendentes();
+        }
+      } else {
+        lcd.print("MODO OFFLINE");
+        Serial.println("WiFi nao conectado - modo offline");
+      }
+      
+      lcd.setCursor(0, 1);
+      lcd.print("L:");
+      lcd.print(contador);
+      lcd.print("/");
+      lcd.print(NUM_LEITURAS_DISPLAY);
+      
+      delay(2000);
+      
+      Serial.println("=== RESET WIFI CONCLUIDO ===");
+    }
+  }
+  
+  ultimoEstadoReset = estadoAtualReset;
+}
+
+// ========== FUNÇÃO EXIBIR RELÓGIO OFFLINE ==========
+void exibirRelogio() {
+  lcd.clear();
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    lcd.print("Hora: ");
+    if (timeinfo.tm_hour < 10) lcd.print("0");
+    lcd.print(timeinfo.tm_hour);
+    lcd.print(":");
+    if (timeinfo.tm_min < 10) lcd.print("0");
+    lcd.print(timeinfo.tm_min);
+    lcd.print(":");
+    if (timeinfo.tm_sec < 10) lcd.print("0");
+    lcd.print(timeinfo.tm_sec);
+  } else {
+    if (inicioDiaMillis == 0) {
+      lcd.print("Aguardando inicio");
+      lcd.setCursor(0, 1);
+      lcd.print("Modo Offline");
+    } else {
+      unsigned long tempoDecorrido = millis() - inicioDiaMillis;
+      unsigned long horas = tempoDecorrido / 3600000;
+      unsigned long minutos = (tempoDecorrido % 3600000) / 60000;
+      unsigned long segundos = (tempoDecorrido % 60000) / 1000;
+      
+      lcd.print("Tempo Dia: ");
+      if (horas < 10) lcd.print("0");
+      lcd.print(horas);
+      lcd.print(":");
+      if (minutos < 10) lcd.print("0");
+      lcd.print(minutos);
+      lcd.print(":");
+      if (segundos < 10) lcd.print("0");
+      lcd.print(segundos);
+    }
+  }
+  
+  lcd.setCursor(0, 1);
+  switch(estadoAtual) {
+    case AGUARDANDO_INICIO: lcd.print("Aguardando "); lcd.print(HORA_INICIO); lcd.print(":00"); break;
+    case EXIBINDO_INTERVALO: lcd.print("Preparando..."); break;
+    case MEDINDO: lcd.print("Medindo..."); break;
+    case EXIBINDO_MEDIA_FINAL: lcd.print("Media Calculada!"); break;
+    case EXIBINDO_PAINEIS: lcd.print("Estimativa Paineis"); break;
+    case HORARIO_FINALIZADO: lcd.print("Finalizado "); lcd.print(HORA_FIM); lcd.print(":"); if(MINUTO_FIM < 10) lcd.print("0"); lcd.print(MINUTO_FIM); break;
+  }
+}
+
+// ========== FUNÇÕES RESTANTES DO CÓDIGO ==========
+void exibirIntervaloETotal() {
+  struct tm timeinfo;
+  
+  lcd.clear();
+  lcd.print("Interv:");
+  lcd.print(intervaloMin, 0);
+  lcd.print("min");
+  
+  lcd.setCursor(0, 1);
+  if (getLocalTime(&timeinfo)) {
+    int horaAtual = timeinfo.tm_hour;
+    int minutoAtual = timeinfo.tm_min;
+    int segundoAtual = timeinfo.tm_sec;
+    int segundosAtuais = horaAtual * 3600 + minutoAtual * 60 + segundoAtual;
+    int segundosInicio = HORA_INICIO * 3600 + MINUTO_INICIO * 60;
+    int segundosFim = HORA_FIM * 3600 + MINUTO_FIM * 60;
+    
+    if (segundosFim <= segundosInicio) {
+      segundosFim += 24 * 3600;
+      if (segundosAtuais < segundosInicio) {
+        segundosAtuais += 24 * 3600;
+      }
+    }
+    
+    int segundosRestantes = segundosFim - segundosAtuais;
+    float minutosRestantes = segundosRestantes / 60.0;
+    
+    lcd.print("Total:");
+    lcd.print(minutosRestantes, 0);
+    lcd.print("min");
+  } else {
+    lcd.print("Modo Offline");
+  }
+  
+  Serial.printf("Interv: %.0f min | %d leituras | WiFi: %s\n", 
+                intervaloMin, contador, wifiConectado ? "SIM" : "NAO");
+}
+
+bool enviarLeituraParaPlanilha(float irrad) {
+  if (wifiConectado) {
+    HTTPClient http;
+    http.begin(scriptURL);
+    http.addHeader("Content-Type", "application/json");
+
+    struct tm timeinfo;
+    char dataStr[12] = "00/00/0000";
+    char horaStr[12] = "00:00:00";
+    
+    if (getLocalTime(&timeinfo)) {
+      strftime(dataStr, sizeof(dataStr), "%d/%m/%Y", &timeinfo);
+      strftime(horaStr, sizeof(horaStr), "%H:%M:%S", &timeinfo);
+    }
+
+    String jsonData = "{";
+    jsonData += "\"action\":\"escreverEmLista\",";
+    jsonData += "\"data\":\"" + String(dataStr) + "\",";
+    jsonData += "\"hora\":\"" + String(horaStr) + "\",";
+    jsonData += "\"media\":" + String(irrad, 2) + ",";
+    jsonData += "\"energia\":0,";
+    jsonData += "\"energia_pequeno\":0,";
+    jsonData += "\"energia_medio\":0,";
+    jsonData += "\"energia_grande\":0";
+    jsonData += "}";
+
+    Serial.println("Enviando leitura para planilha:");
+    Serial.println(jsonData);
+
+    int httpCode = http.POST(jsonData);
+    if (httpCode > 0) {
+      Serial.printf("Leitura enviada: %d\n", httpCode);
+      http.end();
+      return true;
+    } else {
+      Serial.printf("Erro ao enviar leitura: %s\n", http.errorToString(httpCode).c_str());
+      http.end();
+    }
+  }
+  return false;
+}
+
+bool enviarDadosCompletosParaPlanilha(float media, float energia, float energiaPequeno, float energiaMedio, float energiaGrande) {
+  if (wifiConectado) {
+    HTTPClient http;
+    http.begin(scriptURL);
+    http.addHeader("Content-Type", "application/json");
+
+    struct tm timeinfo;
+    char dataStr[12] = "00/00/0000";
+    char horaStr[12] = "00:00:00";
+    
+    if (getLocalTime(&timeinfo)) {
+      strftime(dataStr, sizeof(dataStr), "%d/%m/%Y", &timeinfo);
+      strftime(horaStr, sizeof(horaStr), "%H:%M:%S", &timeinfo);
+    }
+
+    String jsonData = "{";
+    jsonData += "\"action\":\"escreverEmLista\",";
+    jsonData += "\"data\":\"" + String(dataStr) + "\",";
+    jsonData += "\"hora\":\"" + String(horaStr) + "\",";
+    jsonData += "\"media\":" + String(media, 2) + ",";
+    jsonData += "\"energia\":" + String(energia, 4) + ",";
+    jsonData += "\"energia_pequeno\":" + String(energiaPequeno, 4) + ",";
+    jsonData += "\"energia_medio\":" + String(energiaMedio, 4) + ",";
+    jsonData += "\"energia_grande\":" + String(energiaGrande, 4);
+    jsonData += "}";
+
+    Serial.println("Enviando dados COMPLETOS para planilha:");
+    Serial.println(jsonData);
+
+    int httpCode = http.POST(jsonData);
+    if (httpCode > 0) {
+      Serial.printf("Dados completos enviados: %d\n", httpCode);
+      String response = http.getString();
+      Serial.println("Resposta: " + response);
+      
+      lcd.clear();
+      lcd.print("Dados completos!");
+      lcd.setCursor(0, 1);
+      lcd.print("Enviados OK");
+      delay(2000);
+      return true;
+    } else {
+      Serial.printf("Erro ao enviar dados completos: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  }
+  
+  return salvarDadosLocalmente(media, energia, energiaPequeno, energiaMedio, energiaGrande);
+}
+
+bool salvarDadosLocalmente(float media, float energia, float energiaPequeno, float energiaMedio, float energiaGrande) {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    strftime(dadosAtuais.data, sizeof(dadosAtuais.data), "%d/%m/%Y", &timeinfo);
+  } else {
+    strcpy(dadosAtuais.data, "00/00/0000");
+  }
+  
+  dadosAtuais.media = media;
+  dadosAtuais.energia = energia;
+  dadosAtuais.energiaPequeno = energiaPequeno;
+  dadosAtuais.energiaMedio = energiaMedio;
+  dadosAtuais.energiaGrande = energiaGrande;
+  dadosAtuais.enviado = false;
+  dadosPendentes = true;
+  
+  Serial.println("Dados salvos localmente (pendentes)");
+  Serial.printf("Data: %s | Media: %.1f W/m2 | Energia: %.4f kWh\n", 
+                dadosAtuais.data, media, energia);
+  
+  lcd.clear();
+  lcd.print("Dados salvos");
+  lcd.setCursor(0, 1);
+  lcd.print("localmente");
+  delay(2000);
+  
+  return true;
+}
+
+void tentarEnviarDadosPendentes() {
+  if (dadosPendentes && wifiConectado && !dadosAtuais.enviado && tentarEnvioPendentes) {
+    lcd.clear();
+    lcd.print("Enviando dados");
+    lcd.setCursor(0, 1);
+    lcd.print("pendentes...");
+    
+    Serial.println("Tentando enviar dados pendentes para planilha...");
+    
+    bool sucesso = enviarDadosCompletosParaPlanilha(dadosAtuais.media, dadosAtuais.energia, 
+                          dadosAtuais.energiaPequeno, dadosAtuais.energiaMedio, 
+                          dadosAtuais.energiaGrande);
+    
+    if (sucesso) {
+      dadosPendentes = false;
+      dadosAtuais.enviado = true;
+      tentarEnvioPendentes = false;
+      Serial.println("Dados pendentes enviados com sucesso!");
+      
+      lcd.clear();
+      lcd.print("Envio concluido!");
+      lcd.setCursor(0, 1);
+      lcd.print("Voltando...");
+      delay(2000);
+    } else {
+      Serial.println("Falha no envio dos dados pendentes");
+      tentarEnvioPendentes = false;
+    }
+  }
+}
+
+float lerFotodiodoMelhorado() {
+  int amostras = 15;
+  long soma = 0;
+  for (int i = 0; i < amostras; i++) {
+    soma += analogRead(fotoDiodoPIN);
+    delay(10);
+  }
+  int leituraMedia = soma / amostras;
+  float tensao = (leituraMedia / 4095.0) * 3.3;
+  float irrad = tensao * fatorCalibracao * 1000.0;
+  
+  if (irrad < 0) irrad = 0;
+  
+  return irrad;
+}
+
+void exibirEstimativaPaineis(float media) {
+  unsigned long tempoAtual = millis();
+  
+  if (!paineisExibidos) {
+    paineisExibidos = true;
+    painelAtual = 0;
+    tempoExibicaoPainel = tempoAtual;
+    Serial.println("Iniciando exibicao dos paineis");
+  }
+  
+  float areaPequeno = 1.0;
+  float areaMedio = 2.5;  
+  float areaGrande = 5.0;
+  
+  float energiaPequeno = (media * TEMPO_HORAS_OPERACAO * areaPequeno) / 1000.0;
+  float energiaMedio = (media * TEMPO_HORAS_OPERACAO * areaMedio) / 1000.0;
+  float energiaGrande = (media * TEMPO_HORAS_OPERACAO * areaGrande) / 1000.0;
+  
+  if (tempoAtual - tempoExibicaoPainel >= TEMPO_EXIBICAO_PAINEL) {
+    painelAtual++;
+    tempoExibicaoPainel = tempoAtual;
+    
+    if (painelAtual > 2) {
+      estadoAtual = HORARIO_FINALIZADO;
+      paineisExibidos = false;
+      Serial.println("Todos os paineis foram exibidos");
+      return;
+    }
+  }
+  
+  lcd.clear();
+  switch(painelAtual) {
+    case 0:
+      lcd.print("IRRAD:");
+      lcd.print(media, 1);
+      lcd.print("W/m2");
+      lcd.setCursor(0, 1);
+      lcd.print("EST.PEQ:");
+      lcd.print(energiaPequeno, 3);
+      lcd.print("kWh");
+      break;
+      
+    case 1:
+      lcd.print("IRRAD:");
+      lcd.print(media, 1);
+      lcd.print("W/m2");
+      lcd.setCursor(0, 1);
+      lcd.print("EST.MED:");
+      lcd.print(energiaMedio, 3);
+      lcd.print("kWh");
+      break;
+      
+    case 2:
+      lcd.print("IRRAD:");
+      lcd.print(media, 1);
+      lcd.print("W/m2");
+      lcd.setCursor(0, 1);
+      lcd.print("EST.GRA:");
+      lcd.print(energiaGrande, 3);
+      lcd.print("kWh");
+      break;
+  }
+}
+
+void calcularMediaFinal() {
+  Serial.println("=== INICIANDO CALCULO DA MEDIA ===");
+  
+  if (contador == 0) {
+    Serial.println("Nenhuma leitura para calcular media!");
+    lcd.clear();
+    lcd.print("Sem leituras");
+    lcd.setCursor(0, 1);
+    lcd.print("para calcular");
+    delay(5000);
+    return;
+  }
+  
+  float media = soma_irradiacao / 10;
+  float energia = (media * TEMPO_HORAS_OPERACAO) / 1000.0;
+
+  float areaPequeno = 1.0;
+  float areaMedio = 2.5;  
+  float areaGrande = 5.0;
+  
+  float energiaPequeno = (media * TEMPO_HORAS_OPERACAO * areaPequeno) / 1000.0;
+  float energiaMedio = (media * TEMPO_HORAS_OPERACAO * areaMedio) / 1000.0;
+  float energiaGrande = (media * TEMPO_HORAS_OPERACAO * areaGrande) / 1000.0;
+
+  estadoAtual = EXIBINDO_MEDIA_FINAL;
+  tempoEstadoInicio = millis();
+  
+  lcd.clear();
+  lcd.print("Media:");
+  lcd.print(media, 1);
+  lcd.print("W/m2");
+  lcd.setCursor(0, 1);
+  lcd.print("Energia:");
+  lcd.print(energia, 4);
+  lcd.print("kWh");
+
+  Serial.println("=== MEDIA FINAL CALCULADA ===");
+  Serial.printf("Total de leituras: %d\n", contador);
+  Serial.printf("SOMA TOTAL de todas leituras: %.1f W/m2\n", soma_irradiacao);
+  Serial.printf("MEDIA (Soma ÷ 10): %.1f W/m2\n", media);
+  Serial.printf("Tempo: %.2f horas (%d:%02d-%d:%02d)\n", 
+                TEMPO_HORAS_OPERACAO, HORA_INICIO, MINUTO_INICIO, HORA_FIM, MINUTO_FIM);
+  Serial.printf("Energia gerada: %.4f kWh/m2\n", energia);
+  Serial.printf("Painel Pequeno (1m2): %.4f kWh\n", energiaPequeno);
+  Serial.printf("Painel Medio (2.5m2): %.4f kWh\n", energiaMedio);
+  Serial.printf("Painel Grande (5m2): %.4f kWh\n", energiaGrande);
+  Serial.printf("WiFi: %s | Blynk: %s\n", wifiConectado ? "SIM" : "NAO", blynkConectado ? "SIM" : "NAO");
+  
+  Serial.println("Leituras realizadas:");
+  for (int i = 0; i < contador; i++) {
+    Serial.printf("Leitura %d: %.1f W/m2\n", i+1, leituras[i]);
+  }
+  Serial.println("=======================");
+
+  if (wifiConectado && blynkConectado) {
+    Blynk.virtualWrite(V0, media);
+    Blynk.virtualWrite(V1, 0);
+    Blynk.virtualWrite(V2, contador);
+    Blynk.virtualWrite(V3, energia);
+    Blynk.run();
+  }
+
+  enviarDadosCompletosParaPlanilha(media, energia, energiaPequeno, energiaMedio, energiaGrande);
+  
+  cicloConcluidoHoje = true;
+  Serial.println("Media sera exibida por 10 segundos...");
+}
+
+void medirIrradiacao() {
+  if (estadoAtual != MEDINDO || sistemaPausado) {
+    Serial.printf("medirIrradiacao() BLOQUEADA - Estado: %d, Pausado: %d\n", 
+                  estadoAtual, sistemaPausado);
+    return;
+  }
+  
+  if (horarioFinalizado()) {
+    Serial.println("HORARIO FINALIZADO - Calculando media...");
+    calcularMediaFinal();
+    return;
+  }
+  
+  if (contador >= NUM_LEITURAS) {
+    Serial.println("LEITURAS COMPLETAS - Calculando media...");
+    calcularMediaFinal();
+    return;
+  }
+  
+  Serial.printf("REALIZANDO LEITURA %d...\n", contador + 1);
+  float irrad = lerFotodiodoMelhorado();
+
+  if (irrad > 600.0) {
+    digitalWrite(ledPin, HIGH);
+    Serial.println("LED ACESO - Excelente irradiacao!");
+  } else {
+    digitalWrite(ledPin, LOW);
+  }
+
+  if (contador < NUM_LEITURAS) {
+    leituras[contador] = irrad;
+    soma_irradiacao += irrad;
+    contador++;
+
+    Serial.printf("Leitura %d: %.1f W/m2 | SOMA: %.1f W/m2 | WiFi: %s\n", 
+                  contador, irrad, soma_irradiacao, wifiConectado ? "SIM" : "NAO");
+
+    lcd.clear();
+    lcd.print("Irrad:");
+    lcd.print(irrad, 1);
+    lcd.print("W/m2");
+    lcd.setCursor(0, 1);
+    
+    int displayLeitura = (contador > NUM_LEITURAS_DISPLAY) ? NUM_LEITURAS_DISPLAY : contador;
+    lcd.print("L:");
+    lcd.print(displayLeitura);
+    lcd.print("/");
+    lcd.print(NUM_LEITURAS_DISPLAY);
+    
+    lcd.print(" I:");
+    lcd.print(intervaloMin, 1);
+    lcd.print("m");
+
+    if (wifiConectado) {
+      enviarLeituraParaPlanilha(irrad);
+    }
+
+    if (wifiConectado && blynkConectado) {
+      Blynk.virtualWrite(V1, irrad);
+      Blynk.virtualWrite(V2, contador);
+      Blynk.run();
+    }
+
+    float intervaloAnterior = intervaloMin;
+    calcularIntervalo();
+    Serial.printf("Intervalo atualizado: %.1f min -> %.1f min\n", 
+                  intervaloAnterior, intervaloMin);
+    
+    if (contador < NUM_LEITURAS) {
+      proximaLeitura = millis() + (unsigned long)(intervaloMin * 60000);
+      
+      Serial.printf("PROXIMA LEITURA: Leitura %d em %.1f minutos\n", 
+                    contador + 1, intervaloMin);
+      Serial.printf("Tempo restante aproximado: %.1f minutos\n", 
+                    intervaloMin * (NUM_LEITURAS - contador));
+      
+      lcd.clear();
+      lcd.print("Prox. em:");
+      lcd.print(intervaloMin, 1);
+      lcd.print("min");
+      lcd.setCursor(0, 1);
+      
+      int proxDisplayLeitura = (contador + 1 > NUM_LEITURAS_DISPLAY) ? NUM_LEITURAS_DISPLAY : contador + 1;
+      lcd.print("Leitura ");
+      lcd.print(proxDisplayLeitura);
+      lcd.print("/");
+      lcd.print(NUM_LEITURAS_DISPLAY);
+      delay(3000);
+    }
+  }
+}
+
+void verificarSeguranca() {
+  if (passouDaHoraFinal() && !verificouAlerta && cicloConcluidoHoje) {
+    verificouAlerta = true;
+    
+    if (!enviouAlerta && wifiConectado) {
+      lcd.clear();
+      lcd.print("Enviando alerta");
+      lcd.setCursor(0, 1);
+      lcd.print("final do dia");
+      
+      if (enviarDadosCompletosParaPlanilha(0, 0, 0, 0, 0)) {
+        enviouAlerta = true;
+        Serial.println("Alerta do final do dia enviado!");
+      }
+    }
+  }
+}
+
+void testarBotoes() {
+  static unsigned long ultimoTeste = 0;
+  if (millis() - ultimoTeste > 5000) {
+    bool pausa = digitalRead(BOTAO_PAUSA);
+    bool reset = digitalRead(BOTAO_RESET_WIFI);
+    
+    Serial.printf("[DEBUG] Pausa: %d | Reset: %d | Sistema Pausado: %d | WiFi: %s | Blynk: %s\n", 
+                  pausa, reset, sistemaPausado, wifiConectado ? "SIM" : "NAO", blynkConectado ? "SIM" : "NAO");
+    
+    ultimoTeste = millis();
+  }
+}
+
+void gerenciarEstados() {
+  unsigned long tempoAtual = millis();
+  
+  verificarSeguranca();
+  controlarPausa();
+  controlarResetWifi();
+  testarBotoes();
+  
+  if (wifiConectado && dadosPendentes && tentarEnvioPendentes) {
+    tentarEnviarDadosPendentes();
+  }
+  
+  static unsigned long ultimaTentativaWiFi = 0;
+  if (!wifiConectado && tempoAtual - ultimaTentativaWiFi >= 30000) {
+    conectarWiFiRapido();
+    ultimaTentativaWiFi = tempoAtual;
+  }
+  
+  if (tempoAtual - ultimoResetEnvio >= 3600000) {
+    tentouEnviarPendentes = false;
+    ultimoResetEnvio = tempoAtual;
+  }
+  
+  if (sistemaPausado) {
+    static unsigned long ultimaAtualizacaoPausa = 0;
+    if (tempoAtual - ultimaAtualizacaoPausa >= 2000) {
+      lcd.clear();
+      lcd.print("SISTEMA PAUSADO");
+      lcd.setCursor(0, 1);
+      
+      int displayLeitura = (leituraPausada + 1 > NUM_LEITURAS_DISPLAY) ? NUM_LEITURAS_DISPLAY : leituraPausada + 1;
+      lcd.print("Prox.Leitura:");
+      lcd.print(displayLeitura);
+      ultimaAtualizacaoPausa = tempoAtual;
+    }
+    return;
+  }
+  
+  static unsigned long ultimoDebugEstado = 0;
+  if (tempoAtual - ultimoDebugEstado >= 3000) {
+    unsigned long tempoRestante = (proximaLeitura > tempoAtual) ? (proximaLeitura - tempoAtual) : 0;
+    Serial.printf("[ESTADO] Estado: %d | Pausado: %d | Leituras: %d/%d | Proxima em: %lu ms (%.1f min)\n", 
+                  estadoAtual, sistemaPausado, contador, NUM_LEITURAS, 
+                  tempoRestante, tempoRestante / 60000.0);
+    ultimoDebugEstado = tempoAtual;
+  }
+  
+  static unsigned long ultimaAtualizacaoLCD = 0;
+  if (estadoAtual == MEDINDO && tempoAtual - ultimaAtualizacaoLCD >= 2000) {
+    if (contador > 0) {
+      lcd.clear();
+      lcd.print("Ultima:");
+      lcd.print(leituras[contador-1], 1);
+      lcd.print("W/m2");
+      lcd.setCursor(0, 1);
+      
+      int displayLeitura = (contador > NUM_LEITURAS_DISPLAY) ? NUM_LEITURAS_DISPLAY : contador;
+      lcd.print("L:");
+      lcd.print(displayLeitura);
+      lcd.print("/");
+      lcd.print(NUM_LEITURAS_DISPLAY);
+      lcd.print(" I:");
+      lcd.print(intervaloMin, 1);
+      lcd.print("m");
+    }
+    ultimaAtualizacaoLCD = tempoAtual;
+  }
+  
+  switch(estadoAtual) {
+    case AGUARDANDO_INICIO:
+      if (horarioPermitido() && !cicloConcluidoHoje) {
+        estadoAtual = EXIBINDO_INTERVALO;
+        tempoEstadoInicio = tempoAtual;
+        calcularIntervalo();
+        exibirIntervaloETotal();
+        Serial.println("INICIANDO CICLO - Exibindo intervalo por 10 segundos...");
+      }
+      break;
+      
+    case EXIBINDO_INTERVALO:
+      if (tempoAtual - tempoEstadoInicio >= TEMPO_EXIBICAO_INTERVALO) {
+        estadoAtual = MEDINDO;
+        medicaoAtiva = true;
+        calcularIntervalo();
+        
+        proximaLeitura = tempoAtual;
+        Serial.println("INICIANDO MEDICOES - Primeira leitura IMEDIATA");
+        
+        lcd.clear();
+        lcd.print("INICIANDO");
+        lcd.setCursor(0, 1);
+        lcd.print("MEDICOES...");
+        delay(1000);
+      } else {
+        static unsigned long ultimaAtualizacao = 0;
+        if (tempoAtual - ultimaAtualizacao >= 5000) {
+          exibirIntervaloETotal();
+          ultimaAtualizacao = tempoAtual;
+        }
+      }
+      break;
+      
+    case MEDINDO:
+      if (tempoAtual >= proximaLeitura) {
+        Serial.println("EXECUTANDO LEITURA...");
+        medirIrradiacao();
+      }
+      
+      if (contador >= NUM_LEITURAS || horarioFinalizado()) {
+        Serial.println("FINALIZANDO MEDICOES - Calculando media...");
+        calcularMediaFinal();
+      }
+      break;
+      
+    case EXIBINDO_MEDIA_FINAL:
+      if (tempoAtual - tempoEstadoInicio >= TEMPO_EXIBICAO_MEDIA) {
+        estadoAtual = EXIBINDO_PAINEIS;
+        float media = soma_irradiacao / 10;
+        exibirEstimativaPaineis(media);
+        Serial.println("INICIANDO EXIBICAO DOS PAINEIS...");
+      }
+      break;
+      
+    case EXIBINDO_PAINEIS:
+      if (estadoAtual == EXIBINDO_PAINEIS) {
+        float media = soma_irradiacao / 10;
+        exibirEstimativaPaineis(media);
+      }
+      break;
+      
+    case HORARIO_FINALIZADO:
+      break;
+  }
+}
+
+// ========== SETUP E LOOP PRINCIPAIS ==========
+void setup() {
+  pinMode(fotoDiodoPIN, INPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(BOTAO_PAUSA, INPUT_PULLUP);
+  pinMode(BOTAO_RESET_WIFI, INPUT_PULLUP);
+  digitalWrite(ledPin, LOW);
+  
+  Serial.begin(115200);
+  Serial.println("=== SISTEMA SOLAR HIBRIDO INICIADO ===");
+  Serial.printf("Horario: %d:%02d - %d:%02d (%.2f horas)\n", HORA_INICIO, MINUTO_INICIO, HORA_FIM, MINUTO_FIM, TEMPO_HORAS_OPERACAO);
+  Serial.printf("Total de leituras: %d (display mostra ate %d)\n", NUM_LEITURAS, NUM_LEITURAS_DISPLAY);
+  
+  Serial.printf("Botao Pausa (Pino %d): %s\n", BOTAO_PAUSA, 
+                digitalRead(BOTAO_PAUSA) == HIGH ? "SOLTO" : "PRESSIONADO");
+  Serial.printf("Botao Reset WiFi (Pino %d): %s\n", BOTAO_RESET_WIFI, 
+                digitalRead(BOTAO_RESET_WIFI) == HIGH ? "SOLTO" : "PRESSIONADO");
+  
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Sistema Hibrido");
+  lcd.setCursor(0, 1);
+  lcd.print("8:00-16:00");  // ATUALIZADO: 8:00-16:00
+  delay(2000);
+  
+  conectarWiFiRapido();
+  
+  estadoAtual = AGUARDANDO_INICIO;
+}
+
+void loop() {
+  if (blynkConectado) {
+    Blynk.run();
+  }
+
+  if (ehNovoDia()) {
+    cicloConcluidoHoje = false;
+    contador = 0;
+    soma_irradiacao = 0.0;
+    paineisExibidos = false;
+    sistemaPausado = false;
+    tempoPausaAcumulado = 0;
+    tempoRestanteLeitura = 0;
+    ajustouIntervalos = false;
+    enviouAlerta = false;
+    verificouAlerta = false;
+    tentarEnvioPendentes = false;
+    tentouEnviarPendentes = false;
+    inicioDiaMillis = 0;
+    tempoOfflineCalculado = false;
+    estadoAtual = AGUARDANDO_INICIO;
+    Serial.println("=== NOVO DIA - SISTEMA RESETADO ===");
+  }
+
+  gerenciarEstados();
+
+  static unsigned long ultimaAtualizacaoRelogio = 0;
+  if (millis() - ultimaAtualizacaoRelogio >= 1000) {
+    if (estadoAtual == AGUARDANDO_INICIO || estadoAtual == HORARIO_FINALIZADO) {
+      exibirRelogio();
+    }
+    ultimaAtualizacaoRelogio = millis();
+  }
+  
+  delay(100);
+}
+
+BLYNK_CONNECTED() {
+  Serial.println("Blynk conectado!");
+  blynkConectado = true;
+  Blynk.virtualWrite(V0, 0);
+  Blynk.virtualWrite(V1, 0);
+  Blynk.virtualWrite(V2, 0);
+  Blynk.virtualWrite(V3, 0);
+}
+
+BLYNK_DISCONNECTED() {
+  Serial.println("Blynk desconectado!");
+  blynkConectado = false;
+}
